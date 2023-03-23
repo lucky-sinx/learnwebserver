@@ -102,16 +102,18 @@ void http_conn::init()
 // 循环读取客户数据，直到无数据可读或者对方关闭连接
 bool http_conn::read() {
     if( m_read_idx >= READ_BUFFER_SIZE ) {
+        // 缓冲满了，下次再读吧
         return false;
     }
     int bytes_read = 0;
     while(true) {
-        // 从m_read_buf + m_read_idx索引出开始保存数据，大小是READ_BUFFER_SIZE - m_read_idx
+        // 不停地读
+        // 从m_read_buf + m_read_idx索引处开始保存数据，大小是READ_BUFFER_SIZE - m_read_idx
         bytes_read = recv(m_sockfd, m_read_buf + m_read_idx, 
         READ_BUFFER_SIZE - m_read_idx, 0 );
         if (bytes_read == -1) {
             if( errno == EAGAIN || errno == EWOULDBLOCK ) {
-                // 没有数据
+                // 表示没有数据
                 break;
             }
             return false;   
@@ -127,11 +129,14 @@ bool http_conn::read() {
 http_conn::LINE_STATUS http_conn::parse_line() {
     char temp;
     for ( ; m_checked_idx < m_read_idx; ++m_checked_idx ) {
+        // 不停地判断字符，检查到\r\n即为一行
         temp = m_read_buf[ m_checked_idx ];
         if ( temp == '\r' ) {
             if ( ( m_checked_idx + 1 ) == m_read_idx ) {
-                return LINE_OPEN;
+//                int m_read_idx;                         // 标识读缓冲区中已经读入的客户端数据的最后一个字节的下一个位置
+                return LINE_OPEN; // 已经检查到最后一个读入的字符了，说明数据不完整
             } else if ( m_read_buf[ m_checked_idx + 1 ] == '\n' ) {
+                // 读取到了\n,说明是一行，更新check_idx,将\r位置变为\0,将\n位置变为\0，并更新check_idx
                 m_read_buf[ m_checked_idx++ ] = '\0';
                 m_read_buf[ m_checked_idx++ ] = '\0';
                 return LINE_OK;
@@ -139,6 +144,7 @@ http_conn::LINE_STATUS http_conn::parse_line() {
             return LINE_BAD;
         } else if( temp == '\n' )  {
             if( ( m_checked_idx > 1) && ( m_read_buf[ m_checked_idx - 1 ] == '\r' ) ) {
+                // 判断前一个字符是\r的话就说明是一行
                 m_read_buf[ m_checked_idx-1 ] = '\0';
                 m_read_buf[ m_checked_idx++ ] = '\0';
                 return LINE_OK;
@@ -146,7 +152,7 @@ http_conn::LINE_STATUS http_conn::parse_line() {
             return LINE_BAD;
         }
     }
-    return LINE_OPEN;
+    return LINE_OPEN;// 否则说明数据不完整
 }
 
 // 解析HTTP请求行，获得请求方法，目标URL,以及HTTP版本号
@@ -166,7 +172,7 @@ http_conn::HTTP_CODE http_conn::parse_request_line(char* text) {
     }
     // /index.html HTTP/1.1
     // 检索字符串 str1 中第一个不在字符串 str2 中出现的字符下标。
-    m_version = strpbrk( m_url, " \t" );
+    m_version = strpbrk( m_url, " \t" );// 找第一个出现的空格或者是'\t'
     if (!m_version) {
         return BAD_REQUEST;
     }
@@ -178,7 +184,7 @@ http_conn::HTTP_CODE http_conn::parse_request_line(char* text) {
      * http://192.168.110.129:10000/index.html
     */
     if (strncasecmp(m_url, "http://", 7) == 0 ) {   
-        m_url += 7;
+        m_url += 7; // m_url==>"192.168...."
         // 在参数 str 所指向的字符串中搜索第一次出现字符 c（一个无符号字符）的位置。
         m_url = strchr( m_url, '/' );
     }
@@ -243,23 +249,26 @@ http_conn::HTTP_CODE http_conn::process_read() {
                 || ((line_status = parse_line()) == LINE_OK)) {
         // 获取一行数据
         text = get_line();
+        // 将start_line更新为m_checked_idx
         m_start_line = m_checked_idx;
         printf( "got 1 http line: %s\n", text );
 
+        // 主状态机地转移逻辑
         switch ( m_check_state ) {
             case CHECK_STATE_REQUESTLINE: {
-                ret = parse_request_line( text );
+                ret = parse_request_line( text ); // 此状态下调用解析请求line
                 if ( ret == BAD_REQUEST ) {
+                    // 语法错误直接结束
                     return BAD_REQUEST;
                 }
                 break;
             }
             case CHECK_STATE_HEADER: {
-                ret = parse_headers( text );
+                ret = parse_headers( text ); // 此状态调用parse_headers解析请求头
                 if ( ret == BAD_REQUEST ) {
                     return BAD_REQUEST;
                 } else if ( ret == GET_REQUEST ) {
-                    return do_request();
+                    return do_request(); // 此函数去解析具体请求信息
                 }
                 break;
             }
@@ -268,7 +277,7 @@ http_conn::HTTP_CODE http_conn::process_read() {
                 if ( ret == GET_REQUEST ) {
                     return do_request();
                 }
-                line_status = LINE_OPEN;
+                line_status = LINE_OPEN; // 行数据尚不完整
                 break;
             }
             default: {
@@ -470,8 +479,9 @@ void http_conn::process() {
     // 解析HTTP请求
     HTTP_CODE read_ret = process_read();
     if ( read_ret == NO_REQUEST ) {
+        // 说明请求不完整，需要继续读取数据，设置EPOLLIN
         modfd( m_epollfd, m_sockfd, EPOLLIN );
-        return;
+        return; // 本次任务完毕，当前worker线程就空闲了，等待继续读取sock完整请求
     }
     
     // 生成响应
