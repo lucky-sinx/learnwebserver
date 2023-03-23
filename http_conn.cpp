@@ -28,14 +28,14 @@ void addfd( int epollfd, int fd, bool one_shot ) {
     // 水平触发模式
     // 检测epollin和设置hup,有了hup对于连接断开就会触发这个，不需要通过读数据返回值来判断了
     event.events = EPOLLIN | EPOLLRDHUP;
-    if(one_shot) 
+    if(one_shot)
     {
         // 防止同一个通信被不同的线程处理
         event.events |= EPOLLONESHOT;
     }
     epoll_ctl(epollfd, EPOLL_CTL_ADD, fd, &event);// 注册动作EPOLL_CTL_ADD
     // 设置文件描述符非阻塞
-    setnonblocking(fd);  
+    setnonblocking(fd);
 }
 
 // 从epoll中移除监听的文件描述符
@@ -70,7 +70,7 @@ void http_conn::close_conn() {
 void http_conn::init(int sockfd, const sockaddr_in& addr){
     m_sockfd = sockfd;
     m_address = addr;
-    
+
     // 端口复用
     int reuse = 1;
     setsockopt( m_sockfd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof( reuse ) );
@@ -82,11 +82,13 @@ void http_conn::init(int sockfd, const sockaddr_in& addr){
 
 void http_conn::init()
 {
+    bytes_have_send = 0;
+    bytes_to_send = 0;
     m_check_state = CHECK_STATE_REQUESTLINE;    // 初始状态为检查请求行
     m_linger = false;       // 默认不保持链接  Connection : keep-alive保持连接
 
     m_method = GET;         // 默认请求方式为GET
-    m_url = 0;              
+    m_url = 0;
     m_version = 0;
     m_content_length = 0;
     m_host = 0;
@@ -109,14 +111,14 @@ bool http_conn::read() {
     while(true) {
         // 不停地读
         // 从m_read_buf + m_read_idx索引处开始保存数据，大小是READ_BUFFER_SIZE - m_read_idx
-        bytes_read = recv(m_sockfd, m_read_buf + m_read_idx, 
+        bytes_read = recv(m_sockfd, m_read_buf + m_read_idx,
         READ_BUFFER_SIZE - m_read_idx, 0 );
         if (bytes_read == -1) {
             if( errno == EAGAIN || errno == EWOULDBLOCK ) {
                 // 表示没有数据
                 break;
             }
-            return false;   
+            return false;
         } else if (bytes_read == 0) {   // 对方关闭连接
             return false;
         }
@@ -159,7 +161,7 @@ http_conn::LINE_STATUS http_conn::parse_line() {
 http_conn::HTTP_CODE http_conn::parse_request_line(char* text) {
     // GET /index.html HTTP/1.1
     m_url = strpbrk(text, " \t"); // 判断第二个参数中的字符哪个在text中最先出现
-    if (! m_url) { 
+    if (! m_url) {
         return BAD_REQUEST;
     }
     // GET\0/index.html HTTP/1.1
@@ -183,7 +185,7 @@ http_conn::HTTP_CODE http_conn::parse_request_line(char* text) {
     /**
      * http://192.168.110.129:10000/index.html
     */
-    if (strncasecmp(m_url, "http://", 7) == 0 ) {   
+    if (strncasecmp(m_url, "http://", 7) == 0 ) {
         m_url += 7; // m_url==>"192.168...."
         // 在参数 str 所指向的字符串中搜索第一次出现字符 c（一个无符号字符）的位置。
         m_url = strchr( m_url, '/' );
@@ -196,7 +198,7 @@ http_conn::HTTP_CODE http_conn::parse_request_line(char* text) {
 }
 
 // 解析HTTP请求的一个头部信息
-http_conn::HTTP_CODE http_conn::parse_headers(char* text) {   
+http_conn::HTTP_CODE http_conn::parse_headers(char* text) {
     // 遇到空行，表示头部字段解析完毕
     if( text[0] == '\0' ) {
         // 如果HTTP请求有消息体，则还需要读取m_content_length字节的消息体，
@@ -333,12 +335,12 @@ void http_conn::unmap() {
 bool http_conn::write()
 {
     int temp = 0;
-    int bytes_have_send = 0;    // 已经发送的字节
-    int bytes_to_send = m_write_idx;// 将要发送的字节 （m_write_idx）写缓冲区中待发送的字节数
-    
+//    int bytes_have_send = 0;    // 已经发送的字节
+//    int bytes_to_send = m_write_idx;// 将要发送的字节 （m_write_idx）写缓冲区中待发送的字节数
+
     if ( bytes_to_send == 0 ) {
         // 将要发送的字节为0，这一次响应结束。
-        modfd( m_epollfd, m_sockfd, EPOLLIN ); 
+        modfd( m_epollfd, m_sockfd, EPOLLIN );
         init();
         return true;
     }
@@ -358,18 +360,50 @@ bool http_conn::write()
         }
         bytes_to_send -= temp;
         bytes_have_send += temp;
-        if ( bytes_to_send <= bytes_have_send ) {
-            // 发送HTTP响应成功，根据HTTP请求中的Connection字段决定是否立即关闭连接
-            unmap();
-            if(m_linger) {
-                init();
-                modfd( m_epollfd, m_sockfd, EPOLLIN );
-                return true;
-            } else {
-                modfd( m_epollfd, m_sockfd, EPOLLIN );
-                return false;
-            } 
+
+        if (bytes_have_send >= m_iv[0].iov_len)
+        {
+            // 头（m_iv[0]）已经发送完毕
+            m_iv[0].iov_len = 0;
+            m_iv[1].iov_base = m_file_address + (bytes_have_send - m_write_idx);
+            m_iv[1].iov_len = bytes_to_send;
         }
+        else
+        {
+            // 还需要继续发送头，修改一下下次写的位置
+            m_iv[0].iov_base = m_write_buf + bytes_have_send;
+            m_iv[0].iov_len = m_iv[0].iov_len - temp;
+        }
+
+        if (bytes_to_send <= 0)// 判断数据是否发完的逻辑
+        {
+            // 没有数据要发送了
+            unmap();
+            modfd(m_epollfd, m_sockfd, EPOLLIN);
+
+            if (m_linger)
+            {
+                init();
+                return true;
+            }
+            else
+            {
+                return false;
+            }
+        }
+
+//        if ( bytes_to_send <= bytes_have_send ) {
+//            // 发送HTTP响应成功，根据HTTP请求中的Connection字段决定是否立即关闭连接
+//            unmap();
+//            if(m_linger) {
+//                init();
+//                modfd( m_epollfd, m_sockfd, EPOLLIN );
+//                return true;
+//            } else {
+//                modfd( m_epollfd, m_sockfd, EPOLLIN );
+//                return false;
+//            }
+//        }
     }
 }
 
@@ -463,6 +497,8 @@ bool http_conn::process_write(HTTP_CODE ret) {
             m_iv[ 1 ].iov_base = m_file_address;
             m_iv[ 1 ].iov_len = m_file_stat.st_size;
             m_iv_count = 2;
+
+            bytes_to_send = m_write_idx + m_file_stat.st_size;
             return true;
         default:
             return false;
@@ -483,7 +519,7 @@ void http_conn::process() {
         modfd( m_epollfd, m_sockfd, EPOLLIN );
         return; // 本次任务完毕，当前worker线程就空闲了，等待继续读取sock完整请求
     }
-    
+
     // 生成响应
     bool write_ret = process_write( read_ret );
     if ( !write_ret ) {

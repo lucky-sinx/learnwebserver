@@ -117,6 +117,9 @@ private:
     struct stat m_file_stat;                // 目标文件的状态。通过它我们可以判断文件是否存在、是否为目录、是否可读，并获取文件大小等信息
     struct iovec m_iv[2];                   // 我们将采用writev来执行写操作，所以定义下面两个成员，其中m_iv_count表示被写内存块的数量。
     int m_iv_count;
+
+    int bytes_to_send;              // 将要发送的数据的字节数
+    int bytes_have_send;            // 已经发送的字节数
 };
 
 #endif
